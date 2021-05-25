@@ -1,0 +1,27 @@
+{
+  "name": "loadbank",
+  "version": "1.0.0",
+  "description": "Modbus interpreter for LoadBank",
+  "main": "modbus.js",
+  "dependencies": {
+    "serialport": "^7.1.5"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "test": "test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/InuyashaITB/LoadBankNodeJS.git"
+  },
+  "keywords": [
+    "modbus",
+    "loadbank"
+  ],
+  "author": "mpeterson",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/InuyashaITB/LoadBankNodeJS/issues"
+  },
+  "homepage": "https://github.com/InuyashaITB/LoadBankNodeJS#readme"
+}
