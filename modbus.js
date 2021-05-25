@@ -1,135 +1,143 @@
 const SerialPort = require('serialport');
 const EventEmitter = require('events');
+const Queue = require('queue-fifo');
 
-const Emits = { Error: 'Error', Ready: 'Ready', RegisterRead: 'RegisterRead', CoilRead: 'CoilRead', GotVoltage: 'GotVoltage', GotCurrent: 'GotCurrent' };
-const Commands = { ConstantCurrent: 1, ConstantVoltage: 2, ConstantPower: 3, SetResistance: 4, ConstantCurrentSoftStart: 20, DynamicMode: 25, ShortCircuitMode: 26, LISTMode: 27, ConstantCurrentLoadUninstallMode: 31, ConstantPowerLoadingAndUnloadMode: 32, ConstantResistanceLoadUnloadMode: 33, ConstantCurrentTransferVoltageMode: 34, ConstantResistanceSwitchVoltageMode:36, BatteryTestMode: 38, ConstantVoltageSoftStartMode: 39, ChangeSystemParameters: 41, EnterON: 42, EnterOFF: 43 };
-const Modes = { CC: Commands.ConstantCurrent, CV: Commands.ConstantVoltage, CP: Commands.ConstantPower, CR: Commands.SetResistance };
-const Registers = { CMD: 0x0A00, IFIX: 0x0A01, UFIX: 0x0A03, PFIX: 0x0A05, RFIX: 0x0A07, U: 0x0B00, I: 0x0B02 };
-const Coils = { PC1: 0x0500, PC2: 0x0501, TRIG: 0x0502, REMOTE: 0x0503, ISTATE: 0x0510, TRACK: 0x0511, MEMORY: 0x0512, VOICEEN: 0x0513, CONNECT: 0x0514, ATEST: 0x0515, ATESTUN : 0x0516, ATESTPASS: 0x0517, IOVER: 0x0520, UOVER: 0x0521, POVER: 0x0522, HEAT: 0x0523, REVERSE: 0x0524, UNREG: 0x0525, ERREP: 0x0526, ERRCAL: 0x0527 };
-const StatusCoils = [Coils.IOVER, Coils.UOVER, Coils.POVER, Coils.HEAT];
+const Emits = { Error: 'Error', Ready: 'Ready', RegisterRead: 'RegisterRead', CoilRead: 'CoilRead', RegisterWritten: 'RegisterWritten', CoilWritten: 'CoilWritten' };
 const Functions = { ReadCoil: 0x01, WriteCoil: 0x05, ReadRegister: 0x03, WriteRegister: 0x10 };
 
+var self;
+
 module.exports.Emits = Emits;
-module.exports.Commands = Commands;
-module.exports.Modes = Modes;
-module.exports.Registers = Registers;
-module.exports.Coils = Coils;
-module.exports.LoadBank = class LoadBank extends EventEmitter {
+module.exports.Modbus = class Modbus extends EventEmitter {
     constructor(serial_port, baud, parity, id) { 
         super();
-        this.initializing = true;
+        self = this;
+        this._last_send_time = 0;
+        this._expected_receive_length = 0;
+        this._receive_buffer = Buffer.alloc(0);
+        this._send_queue = new Queue();
+        this.Ready = false;
         this.SetID(id !== null ? id : 1);        
-        this._serial = new SerialPort(serial_port, {autoOpen: false, baudRate: baud !== null ? baud : 9600, parity: parity !== null ? parity : 'none'}); 
-        this._serial.on('open', () => { console.log("Serial Port Opened"); this._WriteCoil(Coils.PC1, 1); });
+        this._serial = new SerialPort(serial_port, {autoOpen: false, baudRate: baud !== null ? baud : 9600, parity: parity !== null ? parity : 'none', dataBits: 8, stopBits: 1}); 
+        this._serial.on('open', () => { console.log("Serial Port Opened"); self.emit(Emits.Ready); });
+        this._serial.on('error', (e) => { console.log("Serial Port Error", e); self.emit(Emits.Error, e); });
         this._serial.on('data', (data) => {
-            console.log("Received:", data);
-            if(this.initializing)
-            {
-                this.initializing = false
-                this.emit(Emits.Ready);
-            }
+            self._receive_buffer = Buffer.concat([self._receive_buffer, data]);
+            // console.log(self._receive_buffer);
 
-            var calculated_crc = CalculateCRC(data.slice(1, data.length - 2));
-            if(calculated_crc[0] != data[data.length - 2] || calculated_crc[1] != data[data.length - 1]) {
-                this.emit(Emits.Error, 'CRC Error');
+            if(self._receive_buffer.length < self._expected_receive_length)
+                return;
+
+            self._waiting_for_response = false;
+            self._send_queue.dequeue();
+
+            console.log("Evaluating full expression:", self._receive_buffer);
+
+            var calculated_crc = CalculateCRC(self._receive_buffer.slice(0, self._receive_buffer.length - 2));
+            if(calculated_crc[0] != self._receive_buffer[self._receive_buffer.length - 2] || calculated_crc[1] != self._receive_buffer[self._receive_buffer.length - 1]) {
+                self.emit(Emits.Error, 'CRC Error');
+                self._receive_buffer = Buffer.alloc(0);
                 return;
             }
 
 
-            if(data[0] == this._slave_id) {
-                switch(data[1]) {
+            if(self._receive_buffer[0] == self._slave_id) {
+                switch(self._receive_buffer[1]) {
                     case Functions.ReadCoil: 
-                        this.emit(Emits.CoilRead, this._last_coil_access, ParseCoilRead(data));
+                        var data = ParseCoilRead(self._receive_buffer);
+                        self.emit(Emits.CoilRead, self._last_address, data);
                         break;
                     case Functions.ReadRegister: 
-                        this.emit(Emits.RegisterRead, this._last_register_access, ParseRegisterRead(data));
+                        var data = ParseRegisterRead(self._receive_buffer);
+                        self.emit(Emits.RegisterRead, self._last_address, data);
                     break;
-                    case Functions.WriteCoil: break;
-                    case Functions.WriteRegister: break;
+                    case Functions.WriteCoil: 
+                        self.emit(Emits.CoilWritten, self._last_address);
+                        break;
+                    case Functions.WriteRegister: 
+                        self.emit(Emits.RegisterWritten, self._last_address);
+                        break;
                 }
             }
+
+            self._receive_buffer = Buffer.alloc(0);
         });
         this._serial.on('close', () => { console.log('Serial Port Closed'); });
-        this._serial.open();
-        this.on(Emits.ReadRegister, (address, data) => {
-            console.log('ReadRegisterCallback- @', address, ':', data);
-            switch(address) {
-                case Registers.I:    
-                    this.emit(Emits.GotCurrent, BytesToFloat(data));               
-                    break;
-
-                case Registers.U:
-                    this.emit(Emits.GotVoltage, BytesToFloat(data));
-                    break;
+        
+        setInterval(() => {
+            if(!self._send_queue.isEmpty() && !self._waiting_for_response && (new Date()).getTime() - self._last_send_time > 250) {
+                var packet = self._send_queue.peek();
+                self._last_address = packet.address;
+                self._expected_receive_length = packet.response_length;
+                self._waiting_for_response = true;
+                self._last_send_time = (new Date()).getTime();
+                self._serial.write(packet.data, (err) => 
+                { 
+                    if(!err)
+                        console.log('Sent:',this._send_queue.peek());
+                    else 
+                        this.emit(Emits.Error, err); 
+                } );
             }
-        });
+            else if (self._waiting_for_response && (new Date()).getTime() - self._last_send_time > 5000) {
+                self.emit(Emits.Error, 'Packet timeout!');
+                self._waiting_for_response = false;
+            }
+        }, 100);
     }
 
-    SetID(id) { if(id < 1 || id > 255) throw new Error('Invalid ID'); this._slave_id = id; }
+    Open() { self._serial.open(); }
+    SetID(id) { if(id < 1 || id > 255) throw new Error('Invalid ID'); self._slave_id = id; }
 
     _WriteRegister(address, array) {
-        this._last_register_access = address;
-        var packet = BuildSendPacket(this._slave_id, Functions.WriteRegister, [ParseAddress(address), array.length, array]);
-        this._serial.write(packet);
+        self._last_address = address;
+        var packet = BuildSendPacket(self._slave_id, Functions.WriteRegister, [AddressToBytes(address), LengthToBytes(array.length / 2), array.length, array]);
+        self._send_queue.enqueue({address: address, data: packet, response_length: 8});
     }
     _ReadRegister(address, length) {
-        this._last_register_access = address;
-        var packet = BuildSendPacket(this._slave_id, Functions.ReadRegister, [ParseAddress(address), length]);
-        this._serial.write(packet);
+        self._last_address = address;
+        var packet = BuildSendPacket(self._slave_id, Functions.ReadRegister, [AddressToBytes(address), LengthToBytes(length)]);
+        self._send_queue.enqueue({address: address, data: packet, response_length: 3 + (length*2) + 2});
     }
     _WriteCoil(address, value) {
-        this._last_coil_access = address;
-        var packet = BuildSendPacket(this._slave_id, Functions.WriteCoil, [ParseAddress(address), value]);
-        this._serial.write(packet);
+        self._last_address = address;
+
+        if(value)
+            value = [0xFF, 0x00];
+        else
+            value = [0x00, 0x00];
+
+        var packet = BuildSendPacket(self._slave_id, Functions.WriteCoil, [AddressToBytes(address), value]);
+        self._send_queue.enqueue({address: address, data: packet, response_length: 8});
     }
     _ReadCoil(address) {
-        this._last_coil_access = address;
-        var packet = BuildSendPacket(this._slave_id, Functions.ReadCoil, ParseAddress(address));
-        this._serial.write(packet);
+        self._last_address = address;
+        var packet = BuildSendPacket(self._slave_id, Functions.ReadCoil, AddressToBytes(address));
+        self._send_queue.enqueue({address: address, data: packet, response_length: 6});
     }
-
-    SendCommand(cmd) {
-        this._WriteRegister(Registers.CMD, [cmd]);
-    }
-
-    SetMode(mode) {
-        if(mode != Modes.CC && mode != Modes.CP && mode != Modes.CV && mode != Modes.CR)
-            throw new Error('Invalid Mode');
-
-        this.SendCommand(mode);
-    }
-
-    GetStatus() { StatusCoils.forEach(coil => {
-        this._ReadCoil(ParseAddress(coil));
-    });}
-    GetVoltage() { this._ReadRegister(Registers.U, 2); }
-    GetCurrent() { this._ReadRegister(Registers.I, 2); }
-
-    SetCurrent(current) { this._WriteRegister(Registers.IFIX, FloatToBytes(current)); }
-    SetVoltage(volts) { this._WriteRegister(Registers.UFIX, FloatToBytes(volts)); }
-    SetPower(power) { this._WriteRegister(Registers.PFIX, FloatToBytes(power)); }
-    SetResistance(resistance) { this._WriteRegister(Registers.RFIX, FloatToBytes(resistance)); }
-
-    TurnON() { this.SendCommand(Commands.EnterON); }
-    TurnOFF() { this.SendCommand(Commands.EnterOFF); }
 }
 
-function BytesToFloat(data) {
-    var values = new Uint16Array(2);
-    values[0] = data[3] << 8 | data[4];
-    values[1] = data[5] << 8 | data[6];
-    var floats = new Float32Array(values);
-    return floats[0];
+module.exports.FloatToBytes = function FloatToBytes(float) {
+    var buffer = Buffer.alloc(4);
+    buffer.writeFloatBE(float);
+    return buffer;
 }
 
-function FloatToBytes(float) {
-    var float_array = new Float32Array(1);
-    float_array[0] = current;
-    var bytes = new Uint16Array(float_array);
-    return [bytes[1], bytes[0]];
+module.exports.BytesToFloat = function BytesToFloat(data) {
+    return Buffer.from(data).readFloatBE(0);
 }
 
-function ParseAddress(address) {
+function LengthToBytes(length) { 
+    var result = [];
+    var uint16array = new Uint16Array(1);
+    uint16array[0] = length;
+    var uint8array = new Uint8Array(uint16array.buffer);
+    result.push(uint8array[1]);
+    result.push(uint8array[0]);
+    return result;
+}
+
+function AddressToBytes(address) {
     if(Array.isArray(address))
         return address;
     else if (typeof(address) == 'number')
@@ -139,6 +147,7 @@ function ParseAddress(address) {
 }
 
 function ParseCoilRead(data) {
+    var i;
     var length = data[2];
 
     if(length == 1)
@@ -154,15 +163,18 @@ function ParseCoilRead(data) {
 }
 
 function ParseRegisterRead(data) {
+    var i;
     var length = data[2];
     var results = [];
     for(i = 3; i < data.length - 2; i++)
         results.push(data[i]);
+    console.log('Registers Read:', toHexString(results));
     return results;
 }
 
 
 function CalculateCRC(array) {
+    var pos, i;
     var crc = 0xFFFF;
     for(pos = 0; pos < array.length; pos++) {
         crc ^= array[pos];
@@ -176,14 +188,45 @@ function CalculateCRC(array) {
           }
     }
 
-    return [crc & 0xff, (crc & 0xFF00) >> 8];
+    var result = [];
+    result.push(crc&0xff);
+    result.push((crc & 0xFF00) >> 8);
+    return result;
 }
 
 function BuildSendPacket(slave_id, command, data) {
     var result = [];
-    result.push(slave_id & 0xFF);
-    result.push(command & 0xFF);
-    result.push(data);
-    var crc = CalculateCRC(result);
-    result.push(crc);
+    InsertIntoArray(result, slave_id & 0xFF);
+    InsertIntoArray(result, command & 0xFF);
+    InsertIntoArray(result, data);
+    InsertIntoArray(result, CalculateCRC(result));
+    
+    console.log('BuildSendPacket made:', toHexString(result));
+    
+    return result;
+}
+
+function InsertIntoArray(toArray, fromArray) {
+    if(Buffer.isBuffer(fromArray))
+    {
+        var buffer = [];
+        for(var i = 0; i < fromArray.length; i++)   
+            buffer[i] = fromArray[i];
+        InsertIntoArray(toArray, buffer);
+    }
+    else if(Array.isArray(fromArray))
+        for(var i = 0; i < fromArray.length; i++) {
+            if(Array.isArray(fromArray[i]) || Buffer.isBuffer(fromArray[i]))
+                InsertIntoArray(toArray, fromArray[i]); // Recursively flatten array if sub-elements are array as well.
+            else
+                toArray.push(fromArray[i]);
+        }
+    else
+        toArray.push(fromArray);
+}
+
+function toHexString(byteArray) {
+  return '[' + Array.from(byteArray, function(byte) {
+    return '0x' + ('0' + (byte & 0xFF).toString(16)).slice(-2);
+  }).join(',') + ']'
 }
